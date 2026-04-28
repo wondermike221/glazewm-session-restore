@@ -20,14 +20,20 @@
 .PARAMETER Uninstall
     Remove the scheduled task and installed files.
 
+.PARAMETER NonInteractive
+    Skip all prompts; automatically start the task after registration.
+    Used by chezmoi run scripts.
+
 .EXAMPLE
     .\deploy.ps1
+    .\deploy.ps1 -NonInteractive
     .\deploy.ps1 -Uninstall
 #>
 param(
-    [string] $ScriptDir  = "$env:USERPROFILE\.glzr\glazewm",
-    [string] $TaskName   = "GlazeWM Session Restore",
-    [switch] $Uninstall
+    [string] $ScriptDir      = "$env:USERPROFILE\.glzr\glazewm",
+    [string] $TaskName       = "GlazeWM Session Restore",
+    [switch] $Uninstall,
+    [switch] $NonInteractive
 )
 
 Set-StrictMode -Version Latest
@@ -176,7 +182,12 @@ Write-Ok "Task '$TaskName' registered."
 # Optionally start right now
 # --------------------------------------------------------------------------- #
 
-$startNow = Read-Host "`nStart the task now? [Y/n]"
+if ($NonInteractive) {
+    $startNow = "y"
+} else {
+    $startNow = Read-Host "`nStart the task now? [Y/n]"
+}
+
 if ($startNow -ne "n" -and $startNow -ne "N") {
     Write-Step "Starting task..."
     Start-ScheduledTask -TaskName $TaskName

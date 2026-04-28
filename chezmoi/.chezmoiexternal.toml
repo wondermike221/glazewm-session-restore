@@ -1,0 +1,16 @@
+# Drop this file into the ROOT of your chezmoi source directory
+# (i.e. merge it into ~/.local/share/chezmoi/.chezmoiexternal.toml).
+#
+# On every `chezmoi apply` this will clone (first time) or fast-forward pull
+# (subsequent times) the repo to ~/repos/glazewm-session-restore on the target
+# machine, keeping it in sync with GitHub automatically.
+
+["repos/glazewm-session-restore"]
+  type = "git-repo"
+  url  = "https://github.com/wondermike221/glazewm-session-restore.git"
+
+  [repos/glazewm-session-restore.clone]
+    args = ["--depth", "1"]
+
+  [repos/glazewm-session-restore.pull]
+    args = ["--ff-only"]
