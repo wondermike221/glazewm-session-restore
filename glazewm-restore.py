@@ -23,8 +23,6 @@ import ctypes.wintypes
 import faulthandler
 import json
 import logging
-import shutil
-import subprocess
 import threading
 import uuid as _uuid
 from pathlib import Path
@@ -51,25 +49,6 @@ ARGS = _parse_args()
 # Config
 # --------------------------------------------------------------------------- #
 
-# Locate glazewm.exe — check PATH first, then common install locations.
-def _find_glazewm() -> Path:
-    found = shutil.which("glazewm")
-    if found:
-        return Path(found)
-    candidates = [
-        Path(r"C:\Program Files\glzr.io\GlazeWM\cli\glazewm.exe"),
-        Path.home() / "AppData" / "Local" / "Programs" / "GlazeWM" / "glazewm.exe",
-        Path(r"C:\Program Files\GlazeWM\glazewm.exe"),
-    ]
-    for p in candidates:
-        if p.exists():
-            return p
-    raise FileNotFoundError(
-        "glazewm.exe not found on PATH or in common install locations. "
-        "Make sure GlazeWM is installed and on your PATH."
-    )
-
-GLAZEWM_EXE = _find_glazewm()
 IPC_URI = "ws://127.0.0.1:6123"
 LOG_FILE = Path.home() / ".glzr" / "glazewm" / "restore.log"
 WAKE_DELAY = ARGS.wake_delay
@@ -132,14 +111,6 @@ _win32_monitor_count: int = 0
 _win32_monitor_count_lock = threading.Lock()
 
 # --------------------------------------------------------------------------- #
-# GlazeWM CLI helpers
-# --------------------------------------------------------------------------- #
-
-def _run_cmd(*args: str) -> None:
-    subprocess.run([str(GLAZEWM_EXE), *args], capture_output=True, timeout=5)
-
-
-# --------------------------------------------------------------------------- #
 # IPC helper — filters interleaved events so query responses aren't confused
 # --------------------------------------------------------------------------- #
 
@@ -181,12 +152,13 @@ def _monitor_summary(monitors: list[dict]) -> str:
     return "  ".join(parts) if parts else "(no monitors)"
 
 
-def _do_restore(saved: dict[str, int], monitors: list[dict]) -> None:
+async def _do_restore(ws, saved: dict[str, int], monitors: list[dict]) -> None:
+    """Send move-workspace commands via the open IPC WebSocket (no subprocess)."""
     sorted_monitors = sorted(monitors, key=lambda m: m.get("x", 0))
     current: dict[str, int] = {}
     for idx, mon in enumerate(sorted_monitors):
-        for ws in mon.get("children", []):
-            name = ws.get("name")
+        for glaze_ws in mon.get("children", []):
+            name = glaze_ws.get("name")
             if name:
                 current[name] = idx
 
@@ -206,8 +178,8 @@ def _do_restore(saved: dict[str, int], monitors: list[dict]) -> None:
         log.info("Restore: moving %r %s×%d (mon %d → mon %d)",
                  ws_name, direction, steps, current_idx, target_idx)
         for _ in range(steps):
-            _run_cmd("command", f"focus --workspace {ws_name}")
-            _run_cmd("command", f"move-workspace --direction {direction}")
+            await _ws_query(ws, f"command focus --workspace {ws_name}")
+            await _ws_query(ws, f"command move-workspace --direction {direction}")
         any_moved = True
 
     if not any_moved:
@@ -405,7 +377,7 @@ async def _restore_after_delay(restore_target: dict[str, int] | None) -> None:
             data = await _ws_query(ws, "query monitors")
             monitors = data.get("data", {}).get("monitors", [])
             log.info("Post-wake monitor layout: %s", _monitor_summary(monitors))
-            _do_restore(restore_target, monitors)
+            await _do_restore(ws, restore_target, monitors)
             await _unminimize_windows(ws)
             log.info("Restore complete.")
     except Exception as e:
@@ -425,7 +397,14 @@ async def _unminimize_windows(ws) -> None:
         data = await _ws_query(ws, "query windows")
         windows = data.get("data", {}).get("windows", [])
         for win in windows:
-            if win.get("state", "").lower() == "minimized":
+            # GlazeWM ≥ 3.x returns state as a dict {"type": "..."},
+            # older versions returned a plain string.
+            raw_state = win.get("state", "")
+            if isinstance(raw_state, dict):
+                state_str = raw_state.get("type", "")
+            else:
+                state_str = str(raw_state)
+            if state_str.lower() == "minimized":
                 win_id = win.get("id")
                 title = win.get("title", "?")[:60]
                 log.info("Un-minimizing: %r (id=%s)", title, win_id)
@@ -688,7 +667,6 @@ def main() -> None:
         log.warning("faulthandler.enable failed: %s", e)
 
     log.info("glazewm-restore starting (debug=%s, wake_delay=%.1fs).", ARGS.debug, WAKE_DELAY)
-    log.info("glazewm.exe: %s", GLAZEWM_EXE)
 
     t = threading.Thread(target=_power_event_thread, daemon=True)
     t.start()
