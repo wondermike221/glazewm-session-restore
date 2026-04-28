@@ -469,59 +469,78 @@ def _next_seq() -> int:
 
 def _make_wnd_proc():
     def wnd_proc(hwnd, msg, wparam, lparam):
-        if msg == WM_POWERBROADCAST:
-            seq = _next_seq()
+        # Blanket try/except: a ctypes callback that raises an unhandled
+        # exception causes a hard segfault that kills the entire process with
+        # no log output. The Dell U3219Q sends a storm of USB messages when
+        # its power button is pressed (fingerprint reader, KVM hub, DP Alt-Mode
+        # all cycling together), so we must never let any of them crash us.
+        try:
+            if msg == WM_POWERBROADCAST:
+                seq = _next_seq()
 
-            if wparam == PBT_APMSUSPEND:
-                log.info("[PWR #%d] System SUSPEND", seq)
-                _freeze_snapshot()
+                if wparam == PBT_APMSUSPEND:
+                    log.info("[PWR #%d] System SUSPEND", seq)
+                    _freeze_snapshot()
 
-            elif wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
-                label = "RESUME_SUSPEND" if wparam == PBT_APMRESUMESUSPEND else "RESUME_AUTOMATIC"
-                log.info("[PWR #%d] System %s", seq, label)
-                _unfreeze_snapshot()
-                _schedule_restore()
+                elif wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
+                    label = "RESUME_SUSPEND" if wparam == PBT_APMRESUMESUSPEND else "RESUME_AUTOMATIC"
+                    log.info("[PWR #%d] System %s", seq, label)
+                    _unfreeze_snapshot()
+                    _schedule_restore()
 
-            elif wparam == PBT_POWERSETTINGCHANGE:
-                try:
-                    setting = ctypes.cast(
-                        ctypes.c_void_p(lparam),
-                        ctypes.POINTER(_POWERBROADCAST_SETTING),
-                    ).contents
-                    state = setting.Data
-                    state_name = _DISPLAY_STATE_NAMES.get(state, f"UNKNOWN({state})")
-                    log.info("[PWR #%d] Display state → %s", seq, state_name)
+                elif wparam == PBT_POWERSETTINGCHANGE:
+                    try:
+                        setting = ctypes.cast(
+                            ctypes.c_void_p(lparam),
+                            ctypes.POINTER(_POWERBROADCAST_SETTING),
+                        ).contents
+                        state = setting.Data
+                        state_name = _DISPLAY_STATE_NAMES.get(state, f"UNKNOWN({state})")
+                        log.info("[PWR #%d] Display state → %s", seq, state_name)
 
-                    if state == _DISPLAY_OFF:
-                        _freeze_snapshot()
-                    elif state == _DISPLAY_ON:
-                        _unfreeze_snapshot()
-                        _schedule_restore()
-                    elif state == _DISPLAY_DIM:
-                        # DIM during normal screensaver: _frozen is False → ignore.
-                        # DIM as wake signal (e.g. NirSoft reconnect): _frozen is
-                        # True → treat as ON so restore still fires.
-                        with _frozen_lock:
-                            currently_frozen = _frozen
-                        if currently_frozen:
-                            log.info("[PWR #%d] Display DIM while frozen — treating as wake", seq)
+                        if state == _DISPLAY_OFF:
+                            _freeze_snapshot()
+                        elif state == _DISPLAY_ON:
                             _unfreeze_snapshot()
                             _schedule_restore()
-                        else:
-                            log.debug("[PWR #%d] Display DIM (not frozen, screensaver — ignored)", seq)
+                        elif state == _DISPLAY_DIM:
+                            with _frozen_lock:
+                                currently_frozen = _frozen
+                            if currently_frozen:
+                                log.info("[PWR #%d] Display DIM while frozen — treating as wake", seq)
+                                _unfreeze_snapshot()
+                                _schedule_restore()
+                            else:
+                                log.debug("[PWR #%d] Display DIM (not frozen — ignored)", seq)
 
-                except Exception as e:
-                    log.warning("[PWR #%d] Could not parse display state: %s", seq, e)
+                    except Exception as e:
+                        log.warning("[PWR #%d] Could not parse POWERSETTINGCHANGE: %s", seq, e)
 
-        elif msg == 0x0002:  # WM_DESTROY
-            ctypes.windll.user32.PostQuitMessage(0)
+                else:
+                    log.debug("[PWR #%d] WM_POWERBROADCAST wparam=0x%X (unhandled)", seq, wparam)
 
-        return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+            elif msg == 0x0002:  # WM_DESTROY
+                ctypes.windll.user32.PostQuitMessage(0)
+
+            return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        except Exception:
+            # Log the crash but return 0 so Windows doesn't kill the process.
+            log.exception("CRASH in wndproc (msg=0x%X wparam=0x%X) — recovered", msg, wparam)
+            return 0
+
     return WNDPROCTYPE(wnd_proc)
 
 
 def _power_event_thread() -> None:
     """Runs a hidden Win32 message loop to receive power broadcast events."""
+    try:
+        _power_event_thread_inner()
+    except Exception:
+        log.exception("FATAL: power event thread crashed — power notifications disabled.")
+
+
+def _power_event_thread_inner() -> None:
     user32 = ctypes.windll.user32
     proc = _make_wnd_proc()
 
@@ -568,9 +587,29 @@ def _power_event_thread() -> None:
 # Entry point
 # --------------------------------------------------------------------------- #
 
+def _install_crash_logger() -> None:
+    """Log any unhandled exception to the file before the process dies."""
+    import sys
+    orig = sys.excepthook
+    def _hook(exc_type, exc_value, exc_tb):
+        log.critical("UNHANDLED EXCEPTION — process will exit.", exc_info=(exc_type, exc_value, exc_tb))
+        logging.shutdown()
+        orig(exc_type, exc_value, exc_tb)
+    sys.excepthook = _hook
+
+    # Also catch exceptions on non-main threads (Python 3.8+)
+    orig_thread = threading.excepthook
+    def _thread_hook(args):
+        log.critical("UNHANDLED EXCEPTION in thread %s", args.thread, exc_info=(
+            args.exc_type, args.exc_value, args.exc_traceback))
+        orig_thread(args)
+    threading.excepthook = _thread_hook
+
+
 def main() -> None:
     global _loop
 
+    _install_crash_logger()
     log.info("glazewm-restore starting (debug=%s, wake_delay=%.1fs).", ARGS.debug, WAKE_DELAY)
 
     t = threading.Thread(target=_power_event_thread, daemon=True)
@@ -582,6 +621,10 @@ def main() -> None:
         _loop.run_until_complete(_ipc_loop())
     except KeyboardInterrupt:
         log.info("Shutting down.")
+    except Exception:
+        log.exception("FATAL: main loop crashed.")
+    finally:
+        logging.shutdown()
 
 
 if __name__ == "__main__":

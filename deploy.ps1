@@ -63,9 +63,10 @@ if ($Uninstall) {
         Write-Warn "Task '$TaskName' not found — skipping."
     }
 
+    # Remove old VBS launcher if still present from a previous install
     $vbs = Join-Path $ScriptDir "glazewm-restore.vbs"
     if (Test-Path $vbs) {
-        Write-Step "Removing VBS launcher"
+        Write-Step "Removing legacy VBS launcher"
         Remove-Item $vbs -Force
         Write-Ok "Removed $vbs"
     }
@@ -141,34 +142,20 @@ if (Test-Path $srcSleepScript) {
 }
 
 # --------------------------------------------------------------------------- #
-# Create VBScript launcher (suppresses console window on Task Scheduler start)
+# Create PowerShell launcher (hidden window, blocking so task restarts on crash)
 # --------------------------------------------------------------------------- #
+# VBScript is deprecated in Windows 11 — using PowerShell instead.
+# bWaitOnReturn was False in the old VBS, which meant the task exited immediately
+# and the RestartCount setting never fired on Python crashes.
+# Now the task runs pwsh.exe directly (blocking), so if Python dies the task
+# ends and Task Scheduler restarts it up to 5 times.
 
-$vbsPath = Join-Path $ScriptDir "glazewm-restore.vbs"
-Write-Step "Writing VBS launcher → $vbsPath"
-
-# Resolve uv path so the VBS doesn't depend on PATH being fully loaded at logon
 $uvExe = (Get-Command uv).Source
-$vbsContent = @"
-' Silent launcher for glazewm-restore — no console window.
-Dim shell
-Set shell = CreateObject("WScript.Shell")
-shell.Run """$uvExe"" run ""$destScript""", 0, False
-Set shell = Nothing
-"@
-
-Set-Content -Path $vbsPath -Value $vbsContent -Encoding UTF8
-Write-Ok "VBS launcher written."
-
-# --------------------------------------------------------------------------- #
-# Register (or update) Task Scheduler task
-# --------------------------------------------------------------------------- #
-
 Write-Step "Registering scheduled task '$TaskName'..."
 
 $action = New-ScheduledTaskAction `
-    -Execute "wscript.exe" `
-    -Argument "`"$vbsPath`""
+    -Execute "pwsh.exe" `
+    -Argument "-NonInteractive -WindowStyle Hidden -Command `"& '$uvExe' run '$destScript'`""
 
 # Run at logon of the current user
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
