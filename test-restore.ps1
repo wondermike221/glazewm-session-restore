@@ -1,113 +1,110 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Automated end-to-end test for glazewm-restore using MultiMonitorTool.
+    Watches the glazewm-restore log during a manual monitor power-cycle test.
 
 .DESCRIPTION
-    Disables one monitor (simulating disconnect), waits, re-enables it, then
-    reads the restore log to verify the sequence fired correctly.
+    Tails the log in real time and reports whether the freeze→restore
+    sequence fires correctly. You trigger the event manually (physical
+    monitor power button, or natural timeout).
 
-.PARAMETER Monitor
-    Which monitor to disconnect: Left (Dell U3219Q, DISPLAY2) or Right (G27QC A, DISPLAY1).
-    Default: Left
+    Recommended test procedure:
+      1. Run this script in a terminal (it starts watching immediately).
+      2. Press the POWER BUTTON on the Dell monitor to turn it OFF.
+      3. Wait 3-5 seconds.
+      4. Press the power button again to turn it ON.
+      5. Watch this script report the sequence as it happens.
+      6. Press Ctrl+C to exit once you see the result.
 
-.PARAMETER DisableSeconds
-    Seconds to leave the monitor disabled. Default: 5
+    For the natural-timeout test: run this script, then leave the machine
+    and come back after the monitors sleep. The result will be waiting.
 
-.PARAMETER WakeDelay
-    Must match the --wake-delay the daemon is running with. Default: 3.0
+.PARAMETER TimeoutSeconds
+    Give up waiting after this many seconds with no result. Default: 120.
 
-.PARAMETER MmtPath
-    Path to MultiMonitorTool.exe. Default: ~/Downloads/MultiMonitorTool.exe
+.PARAMETER LogFile
+    Path to the restore log. Default: auto-detected from ~/.glzr/glazewm/restore.log
 #>
 param(
-    [ValidateSet("Left","Right")] [string] $Monitor      = "Left",
-    [int]    $DisableSeconds = 5,
-    [float]  $WakeDelay      = 3.0,
-    [string] $MmtPath        = "$env:USERPROFILE\Downloads\MultiMonitorTool.exe"
+    [int]    $TimeoutSeconds = 120,
+    [string] $LogFile = "$env:USERPROFILE\.glzr\glazewm\restore.log"
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
 
-$LogFile = "$env:USERPROFILE\.glzr\glazewm\restore.log"
-
-# Monitor names from MultiMonitorTool /stext output
-$Monitors = @{
-    Left  = @{ Name = "\\.\DISPLAY2"; Label = "Dell U3219Q (left, monitor idx 0)"  }
-    Right = @{ Name = "\\.\DISPLAY1"; Label = "G27QC A (primary/right, monitor idx 1)" }
+if (-not (Test-Path $LogFile)) {
+    Write-Error "Log file not found: $LogFile — is glazewm-restore running?"
 }
 
-$target = $Monitors[$Monitor]
-
-if (-not (Test-Path $MmtPath)) {
-    Write-Error "MultiMonitorTool.exe not found at $MmtPath"
+function Write-Event([string]$msg, [string]$color = "Cyan") {
+    $ts = Get-Date -Format "HH:mm:ss"
+    Write-Host "[$ts] $msg" -ForegroundColor $color
 }
 
-function Write-Step([string]$msg) { Write-Host "  » $msg" -ForegroundColor Cyan }
-function Write-Ok([string]$msg)   { Write-Host "  ✓ $msg" -ForegroundColor Green }
-function Write-Warn([string]$msg) { Write-Host "  ! $msg" -ForegroundColor Yellow }
+# Start from current end of log
+$startLine = (Get-Content $LogFile | Measure-Object -Line).Lines
 
-# Tail the log from this point forward
-$logLineBefore = (Get-Content $LogFile -ErrorAction SilentlyContinue | Measure-Object -Line).Lines
+Write-Host ""
+Write-Host "glazewm-restore test watcher" -ForegroundColor Magenta
+Write-Host "  Log     : $LogFile"
+Write-Host "  Timeout : ${TimeoutSeconds}s"
+Write-Host ""
+Write-Host "  ► Now press the Dell monitor POWER BUTTON (or wait for natural sleep)" -ForegroundColor Yellow
+Write-Host "  ► Press Ctrl+C to exit`n" -ForegroundColor DarkGray
 
-function Get-NewLogLines {
+$deadline  = (Get-Date).AddSeconds($TimeoutSeconds)
+$seenFreeze   = $false
+$seenRestore  = $false
+$seenMinimize = $false
+$result       = $null
+
+while ((Get-Date) -lt $deadline -and -not $result) {
+    Start-Sleep -Milliseconds 300
+
     $all = Get-Content $LogFile -ErrorAction SilentlyContinue
-    if ($all.Count -gt $logLineBefore) {
-        $all[$logLineBefore..($all.Count - 1)]
+    if ($all.Count -le $startLine) { continue }
+
+    $newLines = $all[$startLine..($all.Count - 1)]
+    $startLine = $all.Count
+
+    foreach ($line in $newLines) {
+        # Always echo new lines
+        $color = "Gray"
+        if ($line -match "FREEZING|FROZEN")          { $color = "Yellow"  }
+        if ($line -match "reconnect|UNFROZEN")        { $color = "Cyan"    }
+        if ($line -match "Restore|Un-minim")          { $color = "Green"   }
+        if ($line -match "WARN|ERROR|failed")         { $color = "Red"     }
+        if ($line -match "monitor-updated")           { $color = "Magenta" }
+        Write-Host "  $line" -ForegroundColor $color
+
+        # Track sequence
+        if ($line -match "FREEZING|snapshot FROZEN")        { $seenFreeze   = $true }
+        if ($line -match "Un-minimizing")                   { $seenMinimize = $true }
+        if ($line -match "Restore complete")                { $seenRestore  = $true; $result = "PASS" }
+        if ($line -match "nothing to move")                 { $seenRestore  = $true; $result = "PASS_NOOP" }
+        if ($line -match "Restore failed")                  { $result = "FAIL" }
     }
 }
 
-Write-Host "`nglazewm-restore end-to-end test" -ForegroundColor Magenta
-Write-Host "  Monitor : $($target.Label)"
-Write-Host "  Disable : ${DisableSeconds}s  Wake delay: ${WakeDelay}s"
-Write-Host "  Log     : $LogFile`n"
-
-# ── 1. Disable monitor ──────────────────────────────────────────────────────
-Write-Step "Disabling $($target.Name)..."
-& $MmtPath /disable $target.Name
-Start-Sleep -Seconds $DisableSeconds
-
-# ── 2. Check freeze fired ───────────────────────────────────────────────────
-$lines = Get-NewLogLines
-$freezeLine = $lines | Select-String "FREEZING|snapshot FROZEN"
-if ($freezeLine) {
-    Write-Ok "Freeze detected:`n    $($freezeLine.Line)"
-} else {
-    Write-Warn "No freeze line found yet — daemon may not have seen the disconnect."
-    Write-Warn "New log lines so far:"
-    $lines | ForEach-Object { Write-Host "    $_" }
-}
-
-# ── 3. Re-enable monitor ────────────────────────────────────────────────────
-Write-Step "Re-enabling $($target.Name)..."
-& $MmtPath /enable $target.Name
-
-# Wait for wake delay + restore + buffer
-$totalWait = [int]($WakeDelay + 8)
-Write-Step "Waiting ${totalWait}s for restore to complete..."
-Start-Sleep -Seconds $totalWait
-
-# ── 4. Check restore fired ──────────────────────────────────────────────────
-$lines = Get-NewLogLines
-
-Write-Host "`n── New log entries since test started ────────────────────────────" -ForegroundColor DarkGray
-$lines | ForEach-Object { Write-Host "  $_" }
-Write-Host "──────────────────────────────────────────────────────────────────" -ForegroundColor DarkGray
-
-# Evaluate result
-$restoreComplete = $lines | Select-String "Restore complete"
-$nothingToMove   = $lines | Select-String "nothing to move"
-$restoreFailed   = $lines | Select-String "Restore failed"
-
 Write-Host ""
-if ($restoreComplete) {
-    Write-Ok "PASS — restore completed."
-} elseif ($nothingToMove) {
-    Write-Ok "PASS — restore ran, nothing needed moving (layout already correct)."
-} elseif ($restoreFailed) {
-    Write-Warn "FAIL — restore attempted but errored."
-    $restoreFailed | ForEach-Object { Write-Host "    $($_.Line)" -ForegroundColor Red }
-} else {
-    Write-Warn "INCONCLUSIVE — no restore line found. Check log above for clues."
+Write-Host "── Result ──────────────────────────────────────────────────" -ForegroundColor DarkGray
+Write-Host "  Freeze triggered : $(if ($seenFreeze)   {'✓'} else {'✗ NOT SEEN — monitor-updated may not have fired, or count did not change'})"
+Write-Host "  Windows restored : $(if ($seenRestore)  {'✓'} else {'✗ NOT SEEN'})"
+Write-Host "  Windows unminimized : $(if ($seenMinimize) {'✓'} else {'-  (none were minimized)'})"
+
+switch ($result) {
+    "PASS"      { Write-Host "`n  PASS — restore ran and moved workspaces back." -ForegroundColor Green }
+    "PASS_NOOP" { Write-Host "`n  PASS (noop) — restore ran; layout was already correct." -ForegroundColor Green }
+    "FAIL"      { Write-Host "`n  FAIL — restore attempted but errored. Check log above." -ForegroundColor Red }
+    $null {
+        if (-not $seenFreeze) {
+            Write-Host "`n  INCONCLUSIVE — no freeze fired." -ForegroundColor Yellow
+            Write-Host "  Likely cause: GlazeWM did not report a monitor count change." -ForegroundColor Yellow
+            Write-Host "  Check the 'monitor-updated: count N→N' lines above." -ForegroundColor Yellow
+        } else {
+            Write-Host "`n  INCONCLUSIVE — freeze fired but restore never completed." -ForegroundColor Yellow
+            Write-Host "  Monitor may not have reconnected, or wake event was not received." -ForegroundColor Yellow
+        }
+    }
 }
+Write-Host "────────────────────────────────────────────────────────────`n" -ForegroundColor DarkGray

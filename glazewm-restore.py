@@ -270,6 +270,12 @@ async def _ipc_loop() -> None:
                     # The IPC event fires before the power notification arrives,
                     # so we freeze here to guarantee _saved isn't overwritten
                     # with the scrambled post-disconnect layout.
+                    if event_type == "monitor-updated":
+                        log.info(
+                            "monitor-updated: count %d→%d  layout: %s",
+                            prev_count, new_count, _monitor_summary(monitors),
+                        )
+
                     if event_type == "monitor-updated" and prev_count > 0 and new_count < prev_count:
                         log.info(
                             "IPC disconnect: monitor count %d→%d — "
