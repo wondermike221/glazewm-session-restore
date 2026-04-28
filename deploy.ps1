@@ -147,7 +147,7 @@ $action = New-ScheduledTaskAction `
 $trigger = New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\$env:USERNAME"
 
 $settings = New-ScheduledTaskSettingsSet `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `   # no time limit
+    -ExecutionTimeLimit (New-TimeSpan -Hours 0) `
     -RestartCount 5 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -StartWhenAvailable `
