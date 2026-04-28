@@ -23,6 +23,7 @@ import ctypes.wintypes
 import faulthandler
 import json
 import logging
+import sys
 import threading
 import uuid as _uuid
 from pathlib import Path
@@ -152,8 +153,11 @@ def _monitor_summary(monitors: list[dict]) -> str:
     return "  ".join(parts) if parts else "(no monitors)"
 
 
-async def _do_restore(ws, saved: dict[str, int], monitors: list[dict]) -> None:
-    """Send move-workspace commands via the open IPC WebSocket (no subprocess)."""
+async def _do_restore(ws, saved: dict[str, int], monitors: list[dict]) -> set[str]:
+    """
+    Send move-workspace commands via the open IPC WebSocket (no subprocess).
+    Returns the set of workspace names that were actually moved.
+    """
     sorted_monitors = sorted(monitors, key=lambda m: m.get("x", 0))
     current: dict[str, int] = {}
     for idx, mon in enumerate(sorted_monitors):
@@ -164,7 +168,7 @@ async def _do_restore(ws, saved: dict[str, int], monitors: list[dict]) -> None:
 
     log.info("Restore — target: %s  current: %s", saved, current)
 
-    any_moved = False
+    moved: set[str] = set()
     for ws_name, target_idx in saved.items():
         current_idx = current.get(ws_name)
         if current_idx is None:
@@ -180,10 +184,12 @@ async def _do_restore(ws, saved: dict[str, int], monitors: list[dict]) -> None:
         for _ in range(steps):
             await _ws_query(ws, f"command focus --workspace {ws_name}")
             await _ws_query(ws, f"command move-workspace --direction {direction}")
-        any_moved = True
+        moved.add(ws_name)
 
-    if not any_moved:
+    if not moved:
         log.info("Restore: nothing to move — layout already matches saved state.")
+
+    return moved
 
 
 # --------------------------------------------------------------------------- #
@@ -377,8 +383,9 @@ async def _restore_after_delay(restore_target: dict[str, int] | None) -> None:
             data = await _ws_query(ws, "query monitors")
             monitors = data.get("data", {}).get("monitors", [])
             log.info("Post-wake monitor layout: %s", _monitor_summary(monitors))
-            await _do_restore(ws, restore_target, monitors)
-            await _unminimize_windows(ws)
+            moved_workspaces = await _do_restore(ws, restore_target, monitors)
+            if moved_workspaces:
+                await _unminimize_on_workspaces(ws, moved_workspaces)
             log.info("Restore complete.")
     except Exception as e:
         log.error("Restore failed: %s", e)
@@ -387,27 +394,33 @@ async def _restore_after_delay(restore_target: dict[str, int] | None) -> None:
             _restore_pending = False
 
 
-async def _unminimize_windows(ws) -> None:
+async def _unminimize_on_workspaces(ws, workspace_names: set[str]) -> None:
     """
-    Un-minimize any windows that Windows minimized when monitors disconnected.
-    GlazeWM doesn't restore them automatically, so tiled layouts look broken
-    even after workspaces are moved back to the correct monitor.
+    Un-minimize windows that are on the specified workspaces AND are currently
+    minimized. Only touches workspaces we actually moved — avoids restoring
+    windows the user had deliberately minimized on other monitors.
     """
     try:
         data = await _ws_query(ws, "query windows")
         windows = data.get("data", {}).get("windows", [])
         for win in windows:
-            # GlazeWM ≥ 3.x returns state as a dict {"type": "..."},
+            # Only process windows on workspaces we moved
+            ws_name = win.get("workspace_name") or win.get("workspaceName", "")
+            if ws_name not in workspace_names:
+                continue
+
+            # GlazeWM ≥ 3.x returns state as a dict {"type": "minimized"},
             # older versions returned a plain string.
             raw_state = win.get("state", "")
             if isinstance(raw_state, dict):
                 state_str = raw_state.get("type", "")
             else:
                 state_str = str(raw_state)
+
             if state_str.lower() == "minimized":
                 win_id = win.get("id")
                 title = win.get("title", "?")[:60]
-                log.info("Un-minimizing: %r (id=%s)", title, win_id)
+                log.info("Un-minimizing: %r on workspace %r (id=%s)", title, ws_name, win_id)
                 await _ws_query(ws, f"command --id {win_id} toggle-minimized")
     except Exception as e:
         log.warning("Un-minimize pass failed: %s", e)
@@ -652,9 +665,33 @@ def _install_crash_logger() -> None:
     threading.excepthook = _thread_hook
 
 
+_MUTEX_NAME = "Global\\GlazeWMSessionRestore"
+_mutex_handle = None   # kept alive for the process lifetime
+
+def _acquire_single_instance() -> None:
+    """
+    Create a named Windows mutex. If one already exists another instance is
+    running — log an error and exit so we don't get duplicate restores.
+    """
+    global _mutex_handle
+    ERROR_ALREADY_EXISTS = 0xB7
+    _mutex_handle = ctypes.windll.kernel32.CreateMutexW(None, True, _MUTEX_NAME)
+    if ctypes.windll.kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+        # Log to file first (logging may not be up yet, so use print as fallback)
+        msg = "Another instance is already running — exiting."
+        try:
+            log.error(msg)
+            logging.shutdown()
+        except Exception:
+            pass
+        print(msg, file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     global _loop
 
+    _acquire_single_instance()
     _install_crash_logger()
 
     # faulthandler writes a C-level traceback to crash.log on segfault / stack
