@@ -23,6 +23,7 @@ import ctypes.wintypes
 import faulthandler
 import json
 import logging
+import shutil
 import subprocess
 import threading
 import uuid as _uuid
@@ -50,7 +51,25 @@ ARGS = _parse_args()
 # Config
 # --------------------------------------------------------------------------- #
 
-GLAZEWM_EXE = Path.home() / "AppData" / "Local" / "Programs" / "GlazeWM" / "glazewm.exe"
+# Locate glazewm.exe — check PATH first, then common install locations.
+def _find_glazewm() -> Path:
+    found = shutil.which("glazewm")
+    if found:
+        return Path(found)
+    candidates = [
+        Path(r"C:\Program Files\glzr.io\GlazeWM\cli\glazewm.exe"),
+        Path.home() / "AppData" / "Local" / "Programs" / "GlazeWM" / "glazewm.exe",
+        Path(r"C:\Program Files\GlazeWM\glazewm.exe"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    raise FileNotFoundError(
+        "glazewm.exe not found on PATH or in common install locations. "
+        "Make sure GlazeWM is installed and on your PATH."
+    )
+
+GLAZEWM_EXE = _find_glazewm()
 IPC_URI = "ws://127.0.0.1:6123"
 LOG_FILE = Path.home() / ".glzr" / "glazewm" / "restore.log"
 WAKE_DELAY = ARGS.wake_delay
@@ -669,6 +688,7 @@ def main() -> None:
         log.warning("faulthandler.enable failed: %s", e)
 
     log.info("glazewm-restore starting (debug=%s, wake_delay=%.1fs).", ARGS.debug, WAKE_DELAY)
+    log.info("glazewm.exe: %s", GLAZEWM_EXE)
 
     t = threading.Thread(target=_power_event_thread, daemon=True)
     t.start()
