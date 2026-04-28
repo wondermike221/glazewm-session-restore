@@ -70,6 +70,13 @@ if ($Uninstall) {
         Write-Ok "Removed $vbs"
     }
 
+    $shortcutPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Sleep Displays.lnk"
+    if (Test-Path $shortcutPath) {
+        Write-Step "Removing Start Menu shortcut"
+        Remove-Item $shortcutPath -Force
+        Write-Ok "Removed shortcut."
+    }
+
     # Leave the .py and log in place so the user keeps their history.
     Write-Host "`nDone. Log and script left in $ScriptDir" -ForegroundColor Green
     exit 0
@@ -112,6 +119,26 @@ $destScript = Join-Path $ScriptDir "glazewm-restore.py"
 Write-Step "Copying glazewm-restore.py → $destScript"
 Copy-Item $srcScript $destScript -Force
 Write-Ok "Script installed."
+
+$srcSleepScript = Join-Path $PSScriptRoot "sleep-displays.ps1"
+if (Test-Path $srcSleepScript) {
+    $destSleepScript = Join-Path $ScriptDir "sleep-displays.ps1"
+    Write-Step "Copying sleep-displays.ps1 → $destSleepScript"
+    Copy-Item $srcSleepScript $destSleepScript -Force
+    Write-Ok "sleep-displays.ps1 installed."
+
+    # Create a Start Menu shortcut so it's reachable from PowerToys Run / Win+R
+    $shortcutPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Sleep Displays.lnk"
+    Write-Step "Creating Start Menu shortcut → $shortcutPath"
+    $shell = New-Object -ComObject WScript.Shell
+    $lnk   = $shell.CreateShortcut($shortcutPath)
+    $lnk.TargetPath     = "powershell.exe"
+    $lnk.Arguments      = "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$destSleepScript`""
+    $lnk.WorkingDirectory = $ScriptDir
+    $lnk.Description    = "Sleep all displays immediately (glazewm-restore test / quick leave)"
+    $lnk.Save()
+    Write-Ok "Shortcut created."
+}
 
 # --------------------------------------------------------------------------- #
 # Create VBScript launcher (suppresses console window on Task Scheduler start)
