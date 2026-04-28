@@ -412,7 +412,18 @@ def _make_wnd_proc():
                     elif state == _DISPLAY_ON:
                         _unfreeze_snapshot()
                         _schedule_restore()
-                    # DIM: no action (dimming isn't a disconnect)
+                    elif state == _DISPLAY_DIM:
+                        # DIM during normal screensaver: _frozen is False → ignore.
+                        # DIM as wake signal (e.g. NirSoft reconnect): _frozen is
+                        # True → treat as ON so restore still fires.
+                        with _frozen_lock:
+                            currently_frozen = _frozen
+                        if currently_frozen:
+                            log.info("[PWR #%d] Display DIM while frozen — treating as wake", seq)
+                            _unfreeze_snapshot()
+                            _schedule_restore()
+                        else:
+                            log.debug("[PWR #%d] Display DIM (not frozen, screensaver — ignored)", seq)
 
                 except Exception as e:
                     log.warning("[PWR #%d] Could not parse display state: %s", seq, e)
