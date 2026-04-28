@@ -9,8 +9,8 @@
   type = "git-repo"
   url  = "https://github.com/wondermike221/glazewm-session-restore.git"
 
-  [repos/glazewm-session-restore.clone]
+  ["repos/glazewm-session-restore".clone]
     args = ["--depth", "1"]
 
-  [repos/glazewm-session-restore.pull]
+  ["repos/glazewm-session-restore".pull]
     args = ["--ff-only"]
