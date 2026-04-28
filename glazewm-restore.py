@@ -85,12 +85,22 @@ _saved: dict[str, int] = {}
 _saved_lock = threading.Lock()
 
 # Snapshot captured the moment displays go off — this is what we restore to.
-# Set by the power-event thread; read by _restore_after_delay.
+# Set by the power-event thread OR the IPC loop (whichever fires first).
 _pre_sleep: dict[str, int] = {}
 
 # When True, _ipc_loop skips updating _saved (displays are sleeping/waking).
 _frozen = False
 _frozen_lock = threading.Lock()
+
+# Previous monitor count — used by _ipc_loop to detect disconnects before
+# the power notification arrives (the IPC event fires first in practice).
+_prev_monitor_count: int = 0
+_prev_monitor_count_lock = threading.Lock()
+
+# Prevents duplicate restore coroutines when both the IPC reconnect event
+# and the power-on notification both fire for the same wake cycle.
+_restore_pending = False
+_restore_pending_lock = threading.Lock()
 
 # asyncio event loop reference — set once the loop starts
 _loop: asyncio.AbstractEventLoop | None = None
@@ -189,9 +199,14 @@ async def _ipc_loop() -> None:
     """
     Connects to GlazeWM IPC, subscribes to all events, and keeps _saved
     up-to-date. Reconnects automatically if GlazeWM restarts.
-    Snapshot updates are frozen while displays are sleeping.
+
+    Key design: monitor disconnect is detected HERE (via count change on
+    monitor-updated) rather than waiting for the power notification, because
+    the IPC event fires first. The power notification is a backup.
     """
     import websockets
+
+    global _prev_monitor_count
 
     while True:
         try:
@@ -205,7 +220,9 @@ async def _ipc_loop() -> None:
                 with _saved_lock:
                     _saved.clear()
                     _saved.update(snapshot)
-                log.info("Initial snapshot: %s", snapshot)
+                with _prev_monitor_count_lock:
+                    _prev_monitor_count = len(monitors)
+                log.info("Initial snapshot: %s  [%d monitor(s)]", snapshot, len(monitors))
                 log.debug("Initial monitor layout: %s", _monitor_summary(monitors))
 
                 # 2. Subscribe
@@ -224,30 +241,59 @@ async def _ipc_loop() -> None:
                     event = json.loads(message)
                     event_type = event.get("eventType", "")
 
-                    # Always log every event in debug mode — critical for sequence analysis
                     if ARGS.debug:
                         log.debug("IPC event: %s", event_type)
 
                     if event_type not in LAYOUT_EVENTS:
                         continue
 
-                    # Check freeze flag BEFORE querying — avoids unnecessary IPC traffic
                     with _frozen_lock:
                         frozen = _frozen
 
                     if frozen:
                         log.info(
-                            "SNAPSHOT FROZEN — ignoring %s during display-sleep. "
-                            "Current _saved=%s  _pre_sleep=%s",
+                            "SNAPSHOT FROZEN — ignoring %s. _saved=%s  _pre_sleep=%s",
                             event_type, _saved, _pre_sleep,
                         )
                         continue
 
-                    # Re-query and update snapshot
+                    # Query current monitor state
                     data = await _ws_query(ws, "query monitors")
                     monitors = data.get("data", {}).get("monitors", [])
-                    snapshot = _parse_snapshot(monitors)
+                    new_count = len(monitors)
 
+                    with _prev_monitor_count_lock:
+                        prev_count = _prev_monitor_count
+                        _prev_monitor_count = new_count
+
+                    # ── Disconnect detected ──────────────────────────────────
+                    # The IPC event fires before the power notification arrives,
+                    # so we freeze here to guarantee _saved isn't overwritten
+                    # with the scrambled post-disconnect layout.
+                    if event_type == "monitor-updated" and prev_count > 0 and new_count < prev_count:
+                        log.info(
+                            "IPC disconnect: monitor count %d→%d — "
+                            "FREEZING snapshot NOW (power notification is too late).",
+                            prev_count, new_count,
+                        )
+                        _freeze_snapshot()
+                        continue  # Do NOT update _saved
+
+                    # ── Reconnect detected ───────────────────────────────────
+                    # Handles cases where no power-ON notification arrives
+                    # (e.g. NirSoft software disconnect, or rapid reconnect).
+                    if event_type == "monitor-updated" and prev_count > 0 and new_count > prev_count and _pre_sleep:
+                        log.info(
+                            "IPC reconnect: monitor count %d→%d — "
+                            "scheduling restore (IPC-triggered).",
+                            prev_count, new_count,
+                        )
+                        _unfreeze_snapshot()
+                        _schedule_restore()
+                        continue  # Don't update _saved — restore will handle it
+
+                    # ── Normal snapshot update ───────────────────────────────
+                    snapshot = _parse_snapshot(monitors)
                     with _saved_lock:
                         old = dict(_saved)
                         _saved.clear()
@@ -290,23 +336,33 @@ def _unfreeze_snapshot() -> None:
 
 
 def _schedule_restore() -> None:
-    """Called from Win32 message thread. Posts restore onto the asyncio loop."""
+    """
+    Called from the Win32 message thread or the IPC loop.
+    Deduplicates: if a restore is already pending (e.g. both the IPC
+    reconnect event and the power-ON notification fire for the same wake),
+    the second call is silently dropped.
+    """
+    global _restore_pending
     if _loop is None:
         return
-    # Pass a copy of _pre_sleep at schedule time — this is the guaranteed-good layout
+    with _restore_pending_lock:
+        if _restore_pending:
+            log.info("Restore already pending — ignoring duplicate trigger.")
+            return
+        _restore_pending = True
     restore_target = dict(_pre_sleep) if _pre_sleep else None
     asyncio.run_coroutine_threadsafe(_restore_after_delay(restore_target), _loop)
 
 
 async def _restore_after_delay(restore_target: dict[str, int] | None) -> None:
+    global _restore_pending
     import websockets
 
     if restore_target:
         log.info("Wake detected — will restore to pre-sleep layout %s in %.1fs",
                  restore_target, WAKE_DELAY)
     else:
-        log.warning("Wake detected but no pre-sleep snapshot available — "
-                    "falling back to current _saved.")
+        log.warning("Wake detected but no pre-sleep snapshot — falling back to _saved.")
         with _saved_lock:
             restore_target = dict(_saved)
 
@@ -318,9 +374,32 @@ async def _restore_after_delay(restore_target: dict[str, int] | None) -> None:
             monitors = data.get("data", {}).get("monitors", [])
             log.info("Post-wake monitor layout: %s", _monitor_summary(monitors))
             _do_restore(restore_target, monitors)
+            await _unminimize_windows(ws)
             log.info("Restore complete.")
     except Exception as e:
         log.error("Restore failed: %s", e)
+    finally:
+        with _restore_pending_lock:
+            _restore_pending = False
+
+
+async def _unminimize_windows(ws) -> None:
+    """
+    Un-minimize any windows that Windows minimized when monitors disconnected.
+    GlazeWM doesn't restore them automatically, so tiled layouts look broken
+    even after workspaces are moved back to the correct monitor.
+    """
+    try:
+        data = await _ws_query(ws, "query windows")
+        windows = data.get("data", {}).get("windows", [])
+        for win in windows:
+            if win.get("state", "").lower() == "minimized":
+                win_id = win.get("id")
+                title = win.get("title", "?")[:60]
+                log.info("Un-minimizing: %r (id=%s)", title, win_id)
+                await _ws_query(ws, f"command --id {win_id} toggle-minimized")
+    except Exception as e:
+        log.warning("Un-minimize pass failed: %s", e)
 
 
 # --------------------------------------------------------------------------- #
