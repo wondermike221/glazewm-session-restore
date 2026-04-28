@@ -126,7 +126,7 @@ $vbsContent = @"
 ' Silent launcher for glazewm-restore — no console window.
 Dim shell
 Set shell = CreateObject("WScript.Shell")
-shell.Run """""$uvExe"""" run """"$destScript""""", 0, False
+shell.Run """$uvExe"" run ""$destScript""", 0, False
 Set shell = Nothing
 "@
 
