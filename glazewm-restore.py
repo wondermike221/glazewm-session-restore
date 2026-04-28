@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import ctypes
 import ctypes.wintypes
+import faulthandler
 import json
 import logging
 import subprocess
@@ -104,6 +105,12 @@ _restore_pending_lock = threading.Lock()
 
 # asyncio event loop reference — set once the loop starts
 _loop: asyncio.AbstractEventLoop | None = None
+
+# Win32-side monitor count — initialised from GetSystemMetrics at thread start,
+# then updated on every WM_DISPLAYCHANGE. Separate from _prev_monitor_count (IPC)
+# so the two detection paths don't race each other.
+_win32_monitor_count: int = 0
+_win32_monitor_count_lock = threading.Lock()
 
 # --------------------------------------------------------------------------- #
 # GlazeWM CLI helpers
@@ -413,10 +420,13 @@ async def _unminimize_windows(ws) -> None:
 # --------------------------------------------------------------------------- #
 
 WM_POWERBROADCAST        = 0x0218
+WM_DISPLAYCHANGE         = 0x007E   # fired when display configuration changes
 PBT_APMSUSPEND           = 0x0004
 PBT_APMRESUMESUSPEND     = 0x0007
 PBT_APMRESUMEAUTOMATIC   = 0x0012
 PBT_POWERSETTINGCHANGE   = 0x8013
+
+SM_CMONITORS = 80   # GetSystemMetrics index for monitor count
 
 # Display state values in PBT_POWERSETTINGCHANGE
 _DISPLAY_OFF     = 0
@@ -519,6 +529,32 @@ def _make_wnd_proc():
                 else:
                     log.debug("[PWR #%d] WM_POWERBROADCAST wparam=0x%X (unhandled)", seq, wparam)
 
+            elif msg == WM_DISPLAYCHANGE:
+                # WM_DISPLAYCHANGE is broadcast to ALL top-level (non-message-only)
+                # windows when the display configuration changes — monitor
+                # connect/disconnect, resolution change, etc.  It fires at the same
+                # instant GlazeWM learns about the change, so freezing here prevents
+                # the IPC loop from overwriting _saved with the scrambled layout.
+                seq = _next_seq()
+                new_count = ctypes.windll.user32.GetSystemMetrics(SM_CMONITORS)
+                with _win32_monitor_count_lock:
+                    global _win32_monitor_count
+                    old_count = _win32_monitor_count
+                    _win32_monitor_count = new_count
+                with _frozen_lock:
+                    currently_frozen = _frozen
+                log.info(
+                    "[DISP #%d] WM_DISPLAYCHANGE monitors %d→%d (frozen=%s)",
+                    seq, old_count, new_count, currently_frozen,
+                )
+                if old_count > 0 and new_count < old_count and not currently_frozen:
+                    log.info("[DISP #%d] Monitor count dropped — FREEZING snapshot NOW", seq)
+                    _freeze_snapshot()
+                elif old_count > 0 and new_count > old_count and currently_frozen:
+                    log.info("[DISP #%d] Monitor count recovered — scheduling restore", seq)
+                    _unfreeze_snapshot()
+                    _schedule_restore()
+
             elif msg == 0x0002:  # WM_DESTROY
                 ctypes.windll.user32.PostQuitMessage(0)
 
@@ -563,11 +599,23 @@ def _power_event_thread_inner() -> None:
     wndclass.lpszClassName = "GlazeWMRestoreWatcher"
     user32.RegisterClassW(ctypes.byref(wndclass))
 
-    HWND_MESSAGE = ctypes.wintypes.HWND(-3)
+    # IMPORTANT: do NOT use HWND_MESSAGE (-3) as the parent here.
+    # Message-only windows are excluded from broadcast message routing, so they
+    # never receive WM_DISPLAYCHANGE (or WM_DEVICECHANGE, etc.).  A real
+    # WS_POPUP window with hWndParent=None receives all broadcasts while still
+    # being invisible (we never call ShowWindow).
+    WS_POPUP = 0x80000000
+    user32.CreateWindowExW.restype = ctypes.wintypes.HWND
     hwnd = user32.CreateWindowExW(
         0, "GlazeWMRestoreWatcher", "GlazeWM Restore Watcher",
-        0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None
+        WS_POPUP, 0, 0, 1, 1, None, None, None, None,
     )
+
+    # Seed the Win32 monitor count so WM_DISPLAYCHANGE can detect direction.
+    with _win32_monitor_count_lock:
+        global _win32_monitor_count
+        _win32_monitor_count = user32.GetSystemMetrics(SM_CMONITORS)
+    log.info("Initial Win32 monitor count: %d", _win32_monitor_count)
 
     guid_bytes = _DISPLAY_GUID.bytes_le
     guid = (ctypes.c_byte * 16)(*guid_bytes)
@@ -575,7 +623,7 @@ def _power_event_thread_inner() -> None:
         hwnd, ctypes.byref(guid), 0
     )
 
-    log.info("Power event thread running (HWND=%d).", hwnd)
+    log.info("Power event thread running (HWND=%d) — receiving WM_DISPLAYCHANGE.", hwnd)
 
     msg = ctypes.wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
@@ -610,6 +658,16 @@ def main() -> None:
     global _loop
 
     _install_crash_logger()
+
+    # faulthandler writes a C-level traceback to crash.log on segfault / stack
+    # overflow — catches native SEH faults that Python's try/except cannot see.
+    _crash_file = LOG_FILE.parent / "crash.log"
+    try:
+        faulthandler.enable(file=open(str(_crash_file), "w"), all_threads=True)
+        log.info("faulthandler enabled — crash dumps → %s", _crash_file)
+    except Exception as e:
+        log.warning("faulthandler.enable failed: %s", e)
+
     log.info("glazewm-restore starting (debug=%s, wake_delay=%.1fs).", ARGS.debug, WAKE_DELAY)
 
     t = threading.Thread(target=_power_event_thread, daemon=True)
