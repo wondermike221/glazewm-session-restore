@@ -352,10 +352,23 @@ class _POWERBROADCAST_SETTING(ctypes.Structure):
     ]
 
 
+# On 64-bit Windows, LRESULT and LPARAM are LONG_PTR (64-bit signed).
+# ctypes.wintypes.LPARAM is c_long (32-bit), which overflows on x64 when
+# Windows passes a struct pointer as lparam. Use c_ssize_t (pointer-sized).
+_LRESULT = ctypes.c_ssize_t
+_LPARAM  = ctypes.c_ssize_t
+
 WNDPROCTYPE = ctypes.WINFUNCTYPE(
-    ctypes.c_long, ctypes.wintypes.HWND, ctypes.c_uint,
-    ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM
+    _LRESULT, ctypes.wintypes.HWND, ctypes.c_uint,
+    ctypes.wintypes.WPARAM, _LPARAM,
 )
+
+# Set argtypes on DefWindowProcW to match — prevents the same overflow
+# when we forward unhandled messages back to the default handler.
+ctypes.windll.user32.DefWindowProcW.restype  = _LRESULT
+ctypes.windll.user32.DefWindowProcW.argtypes = [
+    ctypes.wintypes.HWND, ctypes.c_uint, ctypes.wintypes.WPARAM, _LPARAM,
+]
 
 # Sequence counter — every power event gets an incrementing number so
 # you can spot ordering issues in the log immediately.
@@ -387,7 +400,8 @@ def _make_wnd_proc():
             elif wparam == PBT_POWERSETTINGCHANGE:
                 try:
                     setting = ctypes.cast(
-                        lparam, ctypes.POINTER(_POWERBROADCAST_SETTING)
+                        ctypes.c_void_p(lparam),
+                        ctypes.POINTER(_POWERBROADCAST_SETTING),
                     ).contents
                     state = setting.Data
                     state_name = _DISPLAY_STATE_NAMES.get(state, f"UNKNOWN({state})")
