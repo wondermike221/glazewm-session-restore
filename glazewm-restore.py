@@ -10,11 +10,13 @@ GlazeWM's IPC event stream. On monitor wake, restores the layout.
 
 Run with:
     uv run glazewm-restore.py
+    uv run glazewm-restore.py --debug     # verbose logging + console output
 
 Or deploy as a background Task Scheduler job:
     deploy.ps1
 """
 
+import argparse
 import asyncio
 import ctypes
 import ctypes.wintypes
@@ -26,40 +28,75 @@ import uuid as _uuid
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
+# CLI args (parsed early so logging is configured before anything runs)
+# --------------------------------------------------------------------------- #
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="GlazeWM workspace restore daemon")
+    p.add_argument(
+        "--debug", action="store_true",
+        help="Enable DEBUG-level logging and echo all events to stdout",
+    )
+    p.add_argument(
+        "--wake-delay", type=float, default=3.0, metavar="SECS",
+        help="Seconds to wait after display-on before restoring (default: 3.0)",
+    )
+    return p.parse_args()
+
+ARGS = _parse_args()
+
+# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 
 GLAZEWM_EXE = Path.home() / "AppData" / "Local" / "Programs" / "GlazeWM" / "glazewm.exe"
 IPC_URI = "ws://127.0.0.1:6123"
 LOG_FILE = Path.home() / ".glzr" / "glazewm" / "restore.log"
-WAKE_DELAY = 3.0  # seconds to wait after wake before restoring
+WAKE_DELAY = ARGS.wake_delay
 
 # --------------------------------------------------------------------------- #
 # Logging
 # --------------------------------------------------------------------------- #
 
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+_log_level = logging.DEBUG if ARGS.debug else logging.INFO
+_handlers: list[logging.Handler] = [
+    logging.FileHandler(str(LOG_FILE), encoding="utf-8"),
+]
+if ARGS.debug:
+    _handlers.append(logging.StreamHandler())  # also print to console
+
 logging.basicConfig(
-    filename=str(LOG_FILE),
-    level=logging.INFO,
+    level=_log_level,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=_handlers,
 )
 log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
-# Shared state (written by IPC loop, read by power-event thread)
+# Shared state
 # --------------------------------------------------------------------------- #
 
-# Maps workspace name → monitor index (0 = leftmost)
+# Live snapshot: workspace name → monitor index (0 = leftmost).
+# Updated on every layout IPC event UNLESS displays are sleeping.
 _saved: dict[str, int] = {}
 _saved_lock = threading.Lock()
+
+# Snapshot captured the moment displays go off — this is what we restore to.
+# Set by the power-event thread; read by _restore_after_delay.
+_pre_sleep: dict[str, int] = {}
+
+# When True, _ipc_loop skips updating _saved (displays are sleeping/waking).
+_frozen = False
+_frozen_lock = threading.Lock()
 
 # asyncio event loop reference — set once the loop starts
 _loop: asyncio.AbstractEventLoop | None = None
 
 # --------------------------------------------------------------------------- #
-# GlazeWM CLI helpers (used only for restore commands)
+# GlazeWM CLI helpers
 # --------------------------------------------------------------------------- #
 
 def _run_cmd(*args: str) -> None:
@@ -78,8 +115,8 @@ async def _ws_query(ws, command: str) -> dict:
         msg = json.loads(raw)
         if "eventType" not in msg:
             return msg
-        # An event arrived before the response; discard it — the outer
-        # listener loop will re-snapshot when the next event arrives.
+        log.debug("_ws_query: dropped interleaved event %s while waiting for response to %r",
+                  msg.get("eventType"), command)
 
 
 # --------------------------------------------------------------------------- #
@@ -98,6 +135,16 @@ def _parse_snapshot(monitors: list[dict]) -> dict[str, int]:
     return mapping
 
 
+def _monitor_summary(monitors: list[dict]) -> str:
+    """Human-readable monitor list for debug logs."""
+    sorted_monitors = sorted(monitors, key=lambda m: m.get("x", 0))
+    parts = []
+    for i, m in enumerate(sorted_monitors):
+        ws_names = [w.get("name", "?") for w in m.get("children", [])]
+        parts.append(f"mon{i}(x={m.get('x',0)})=[{','.join(ws_names)}]")
+    return "  ".join(parts) if parts else "(no monitors)"
+
+
 def _do_restore(saved: dict[str, int], monitors: list[dict]) -> None:
     sorted_monitors = sorted(monitors, key=lambda m: m.get("x", 0))
     current: dict[str, int] = {}
@@ -107,35 +154,51 @@ def _do_restore(saved: dict[str, int], monitors: list[dict]) -> None:
             if name:
                 current[name] = idx
 
+    log.info("Restore — target: %s  current: %s", saved, current)
+
+    any_moved = False
     for ws_name, target_idx in saved.items():
         current_idx = current.get(ws_name)
-        if current_idx is None or current_idx == target_idx:
+        if current_idx is None:
+            log.warning("Restore: workspace %r not found in current layout — skipping", ws_name)
+            continue
+        if current_idx == target_idx:
+            log.debug("Restore: %r already on monitor %d — skip", ws_name, target_idx)
             continue
         direction = "right" if current_idx < target_idx else "left"
         steps = abs(target_idx - current_idx)
+        log.info("Restore: moving %r %s×%d (mon %d → mon %d)",
+                 ws_name, direction, steps, current_idx, target_idx)
         for _ in range(steps):
             _run_cmd("command", f"focus --workspace {ws_name}")
             _run_cmd("command", f"move-workspace --direction {direction}")
-        log.info("Restored workspace %s → monitor %d", ws_name, target_idx)
+        any_moved = True
+
+    if not any_moved:
+        log.info("Restore: nothing to move — layout already matches saved state.")
 
 
 # --------------------------------------------------------------------------- #
 # GlazeWM IPC WebSocket loop
 # --------------------------------------------------------------------------- #
 
+# All events — logged in debug mode so we can see the full sequence
+_ALL_EVENTS_LOGGED = True
+
 async def _ipc_loop() -> None:
     """
     Connects to GlazeWM IPC, subscribes to all events, and keeps _saved
     up-to-date. Reconnects automatically if GlazeWM restarts.
+    Snapshot updates are frozen while displays are sleeping.
     """
-    import websockets  # imported here so the script fails loudly if missing
+    import websockets
 
     while True:
         try:
             async with websockets.connect(IPC_URI) as ws:
                 log.info("Connected to GlazeWM IPC.")
 
-                # 1. Take an initial snapshot
+                # 1. Initial snapshot
                 data = await _ws_query(ws, "query monitors")
                 monitors = data.get("data", {}).get("monitors", [])
                 snapshot = _parse_snapshot(monitors)
@@ -143,12 +206,13 @@ async def _ipc_loop() -> None:
                     _saved.clear()
                     _saved.update(snapshot)
                 log.info("Initial snapshot: %s", snapshot)
+                log.debug("Initial monitor layout: %s", _monitor_summary(monitors))
 
-                # 2. Subscribe to all events
+                # 2. Subscribe
                 sub_ack = await _ws_query(ws, "sub --events all")
                 log.info("Subscribed (id=%s)", sub_ack.get("data", {}).get("subscriptionId"))
 
-                # 3. Listen and re-snapshot on relevant events
+                # 3. Event loop
                 LAYOUT_EVENTS = {
                     "workspace-activated",
                     "workspace-deactivated",
@@ -160,17 +224,39 @@ async def _ipc_loop() -> None:
                     event = json.loads(message)
                     event_type = event.get("eventType", "")
 
+                    # Always log every event in debug mode — critical for sequence analysis
+                    if ARGS.debug:
+                        log.debug("IPC event: %s", event_type)
+
                     if event_type not in LAYOUT_EVENTS:
                         continue
 
-                    # Re-query monitors to get the fresh layout
+                    # Check freeze flag BEFORE querying — avoids unnecessary IPC traffic
+                    with _frozen_lock:
+                        frozen = _frozen
+
+                    if frozen:
+                        log.info(
+                            "SNAPSHOT FROZEN — ignoring %s during display-sleep. "
+                            "Current _saved=%s  _pre_sleep=%s",
+                            event_type, _saved, _pre_sleep,
+                        )
+                        continue
+
+                    # Re-query and update snapshot
                     data = await _ws_query(ws, "query monitors")
                     monitors = data.get("data", {}).get("monitors", [])
                     snapshot = _parse_snapshot(monitors)
+
                     with _saved_lock:
+                        old = dict(_saved)
                         _saved.clear()
                         _saved.update(snapshot)
+
                     log.info("Snapshot updated on %s: %s", event_type, snapshot)
+                    if ARGS.debug and snapshot != old:
+                        log.debug("  was: %s", old)
+                        log.debug("  monitor detail: %s", _monitor_summary(monitors))
 
         except (OSError, Exception) as e:
             log.warning("IPC disconnected (%s). Retrying in 5s...", e)
@@ -178,33 +264,60 @@ async def _ipc_loop() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Restore trigger (called from the power-event thread via the asyncio loop)
+# Restore trigger
 # --------------------------------------------------------------------------- #
 
+def _freeze_snapshot() -> None:
+    """
+    Called from power-event thread when displays go off.
+    Captures the current layout as _pre_sleep and freezes further updates.
+    """
+    global _pre_sleep
+    with _frozen_lock:
+        global _frozen
+        _frozen = True
+    with _saved_lock:
+        _pre_sleep = dict(_saved)
+    log.info("Display off — snapshot FROZEN. Pre-sleep layout: %s", _pre_sleep)
+
+
+def _unfreeze_snapshot() -> None:
+    """Called from power-event thread when displays come back on."""
+    with _frozen_lock:
+        global _frozen
+        _frozen = False
+    log.info("Display on — snapshot UNFROZEN.")
+
+
 def _schedule_restore() -> None:
-    """Called from the Win32 message thread. Posts restore onto the asyncio loop."""
+    """Called from Win32 message thread. Posts restore onto the asyncio loop."""
     if _loop is None:
         return
-    asyncio.run_coroutine_threadsafe(_restore_after_delay(), _loop)
+    # Pass a copy of _pre_sleep at schedule time — this is the guaranteed-good layout
+    restore_target = dict(_pre_sleep) if _pre_sleep else None
+    asyncio.run_coroutine_threadsafe(_restore_after_delay(restore_target), _loop)
 
 
-async def _restore_after_delay() -> None:
-    log.info("Wake detected — restoring in %.1fs...", WAKE_DELAY)
+async def _restore_after_delay(restore_target: dict[str, int] | None) -> None:
+    import websockets
 
-    # Capture the pre-wake layout NOW, before the IPC loop re-snapshots the
-    # scrambled post-wake state during the delay.
-    with _saved_lock:
-        saved = dict(_saved)
+    if restore_target:
+        log.info("Wake detected — will restore to pre-sleep layout %s in %.1fs",
+                 restore_target, WAKE_DELAY)
+    else:
+        log.warning("Wake detected but no pre-sleep snapshot available — "
+                    "falling back to current _saved.")
+        with _saved_lock:
+            restore_target = dict(_saved)
 
     await asyncio.sleep(WAKE_DELAY)
 
-    # Re-query current (post-scramble) monitor state, then restore to saved
-    import websockets
     try:
         async with websockets.connect(IPC_URI) as ws:
             data = await _ws_query(ws, "query monitors")
             monitors = data.get("data", {}).get("monitors", [])
-            _do_restore(saved, monitors)
+            log.info("Post-wake monitor layout: %s", _monitor_summary(monitors))
+            _do_restore(restore_target, monitors)
             log.info("Restore complete.")
     except Exception as e:
         log.error("Restore failed: %s", e)
@@ -214,17 +327,21 @@ async def _restore_after_delay() -> None:
 # Windows power-event hook (pure ctypes, no pywin32)
 # --------------------------------------------------------------------------- #
 
-# WM_POWERBROADCAST codes
 WM_POWERBROADCAST        = 0x0218
 PBT_APMSUSPEND           = 0x0004
 PBT_APMRESUMESUSPEND     = 0x0007
 PBT_APMRESUMEAUTOMATIC   = 0x0012
 PBT_POWERSETTINGCHANGE   = 0x8013
 
+# Display state values in PBT_POWERSETTINGCHANGE
+_DISPLAY_OFF     = 0
+_DISPLAY_DIM     = 1
+_DISPLAY_ON      = 2
+
 # GUID_CONSOLE_DISPLAY_STATE = {6FE69556-704A-47A0-8F24-C28D936FDA47}
-# bytes_le gives the Windows-native mixed-endian struct layout required by
-# RegisterPowerSettingNotification (Data1/2/3 little-endian, Data4 as-is).
 _DISPLAY_GUID = _uuid.UUID("6FE69556-704A-47A0-8F24-C28D936FDA47")
+
+_DISPLAY_STATE_NAMES = {0: "OFF", 1: "DIM", 2: "ON"}
 
 
 class _POWERBROADCAST_SETTING(ctypes.Structure):
@@ -240,30 +357,55 @@ WNDPROCTYPE = ctypes.WINFUNCTYPE(
     ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM
 )
 
+# Sequence counter — every power event gets an incrementing number so
+# you can spot ordering issues in the log immediately.
+_power_seq = 0
+_power_seq_lock = threading.Lock()
+
+def _next_seq() -> int:
+    global _power_seq
+    with _power_seq_lock:
+        _power_seq += 1
+        return _power_seq
+
 
 def _make_wnd_proc():
     def wnd_proc(hwnd, msg, wparam, lparam):
         if msg == WM_POWERBROADCAST:
+            seq = _next_seq()
+
             if wparam == PBT_APMSUSPEND:
-                log.info("System suspend detected.")
+                log.info("[PWR #%d] System SUSPEND", seq)
+                _freeze_snapshot()
+
             elif wparam in (PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC):
-                log.info("System resume detected.")
+                label = "RESUME_SUSPEND" if wparam == PBT_APMRESUMESUSPEND else "RESUME_AUTOMATIC"
+                log.info("[PWR #%d] System %s", seq, label)
+                _unfreeze_snapshot()
                 _schedule_restore()
+
             elif wparam == PBT_POWERSETTINGCHANGE:
                 try:
                     setting = ctypes.cast(
                         lparam, ctypes.POINTER(_POWERBROADCAST_SETTING)
                     ).contents
                     state = setting.Data
-                    if state == 0:      # display off
-                        log.info("Display off.")
-                    elif state == 2:    # display on
-                        log.info("Display on.")
+                    state_name = _DISPLAY_STATE_NAMES.get(state, f"UNKNOWN({state})")
+                    log.info("[PWR #%d] Display state → %s", seq, state_name)
+
+                    if state == _DISPLAY_OFF:
+                        _freeze_snapshot()
+                    elif state == _DISPLAY_ON:
+                        _unfreeze_snapshot()
                         _schedule_restore()
+                    # DIM: no action (dimming isn't a disconnect)
+
                 except Exception as e:
-                    log.warning("Could not parse display state: %s", e)
+                    log.warning("[PWR #%d] Could not parse display state: %s", seq, e)
+
         elif msg == 0x0002:  # WM_DESTROY
             ctypes.windll.user32.PostQuitMessage(0)
+
         return ctypes.windll.user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     return WNDPROCTYPE(wnd_proc)
 
@@ -271,7 +413,6 @@ def _make_wnd_proc():
 def _power_event_thread() -> None:
     """Runs a hidden Win32 message loop to receive power broadcast events."""
     user32 = ctypes.windll.user32
-
     proc = _make_wnd_proc()
 
     class WNDCLASS(ctypes.Structure):
@@ -299,7 +440,6 @@ def _power_event_thread() -> None:
         0, 0, 0, 0, 0, HWND_MESSAGE, None, None, None
     )
 
-    # Register for display-state power notifications (correct mixed-endian bytes)
     guid_bytes = _DISPLAY_GUID.bytes_le
     guid = (ctypes.c_byte * 16)(*guid_bytes)
     ctypes.windll.user32.RegisterPowerSettingNotification(
@@ -321,13 +461,11 @@ def _power_event_thread() -> None:
 def main() -> None:
     global _loop
 
-    log.info("glazewm-restore starting.")
+    log.info("glazewm-restore starting (debug=%s, wake_delay=%.1fs).", ARGS.debug, WAKE_DELAY)
 
-    # Start Win32 power-event thread
     t = threading.Thread(target=_power_event_thread, daemon=True)
     t.start()
 
-    # Run the asyncio event loop (IPC + restore scheduling) on the main thread
     _loop = asyncio.new_event_loop()
     asyncio.set_event_loop(_loop)
     try:
